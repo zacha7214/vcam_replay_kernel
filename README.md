@@ -1,9 +1,7 @@
 # vcam_replay — simulated USB camera video replay
 
 Replays image sequences as V4L2 video at a controllable frame rate inside a
-Linux guest, delivered as if from a real USB camera. See `CLAUDE.md` for the
-full project brief.
-
+Linux guest, delivered as if from a real USB camera.
 ```
 Phase 1 (no USB):   tools/vcam_feed ──write()──► /dev/vcam0 ─┐
                                                              ├─► vcam core

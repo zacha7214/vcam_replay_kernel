@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0
+ifneq ($(KBUILD_EXTMOD),)
+obj-m += vcam_replay.o
+else
+obj-$(CONFIG_VIDEO_VCAM_REPLAY) += vcam_replay.o
+endif
+vcam_replay-y := vcam_main.o vcam_core.o vcam_chardev.o vcam_usb.o
+
+# Probe the target headers, including vendor backports, rather than the
+# build host's kernel version. Both APIs changed in recent Linux releases.
+ccflags-y += $(shell grep -q 'hrtimer_setup' $(srctree)/include/linux/hrtimer.h && echo -DVCAM_HAVE_HRTIMER_SETUP)
+ccflags-y += $(shell grep -q 'vb2_ops_wait_prepare' $(srctree)/include/media/videobuf2-v4l2.h && echo -DVCAM_HAVE_VB2_WAIT_OPS)

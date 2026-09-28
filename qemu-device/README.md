@@ -5,17 +5,38 @@ endpoint at a fixed frame rate. The guest-side counterpart is the
 `vcam_replay` kernel module (`../driver/`), which binds to it and exposes
 `/dev/videoX`.
 
-Currently the device generates a moving test pattern internally (diagonal
-gradient + a vertical bar that advances one step per frame). That is enough
-to bring up and validate the full stack — QEMU device model → xHCI → USB
-core → `vcam_usb.c` → V4L2 → userspace — before adding a host-side image
-feed (the intended extension point is `vcam_generate_pattern()` in
-`dev-vcam.c`).
+The device generates a moving test pattern by default. With
+`frames=/absolute/host/path/frames.raw`, it replays a memory-mapped file of
+concatenated raw frames in a loop. The file lives on the QEMU host (including
+macOS), not in the guest. Prepare it with `tools/vcam_images.py`; see the
+[main README](../README.md) for the complete built-in kernel and pixel-check
+workflow. Rebuild QEMU with this updated source to obtain the `frames` property.
+Do not modify or truncate the file while QEMU is running.
+
+## Automated setup and local Linux build
+
+From the parent project, use:
+
+```sh
+python3 scripts/setup-qemu.py ~/qemu-11.1.1
+python3 scripts/build-qemu.py --source ~/qemu-11.1.1 -j 4
+```
+
+The first command copies the model and adds the Kconfig/Meson entries below,
+with backups and repeat-run checks. The second builds into `build-vcam/` and
+checks the device properties. Setup has already been applied to
+`/home/ubuntu/qemu-11.1.1`; the build has not been run. Install the dependencies
+listed in the [local Linux workflow](../README.md#build-and-run-locally-on-linux)
+first. That section also covers `scripts/run-qemu.py`, which launches using
+local kernel, disk/initramfs and image paths on Linux or macOS.
+
+The manual integration below is equivalent to the setup script.
 
 ## Placing the file in the QEMU source tree
 
-Tested against QEMU 11.0.1. Copy the device model into QEMU's USB
-device directory:
+The original device targeted QEMU 11.0.1. The new file-replay extension has
+not been compiled/run against QEMU in this environment. Copy the device model
+into QEMU's USB device directory:
 
 ```sh
 cp dev-vcam.c /path/to/qemu/hw/usb/dev-vcam.c
@@ -64,7 +85,7 @@ Sanity check that the device got in:
 ./qemu-system-aarch64 -device usb-vcam,help
 ```
 
-should list `width`, `height`, `fps`, `format` properties.
+should list `width`, `height`, `fps`, `format`, and `frames` properties.
 
 ## Running
 
@@ -74,7 +95,7 @@ Attach an xHCI controller and the camera to your guest:
 qemu-system-aarch64 -M virt -cpu max -m 2G \
     ... kernel/disk options ... \
     -device qemu-xhci,id=xhci \
-    -device usb-vcam,width=640,height=480,fps=30,format=grey
+    -device usb-vcam,bus=xhci.0,width=640,height=480,fps=30,format=grey,frames=/tmp/camera.raw
 ```
 
 Properties:
@@ -85,9 +106,13 @@ Properties:
 | `height` | 480     | frame height in pixels               |
 | `fps`    | 30      | frames per second (1–100000)         |
 | `format` | grey    | `grey` (8-bit) or `yuyv` (packed YUV) |
+| `frames` | unset   | host raw-frame file; unset generates a pattern |
 
 Inside the guest, the device enumerates as `1209:000a QEMU Replay Camera`
-(`lsusb`), and once `vcam_replay.ko` is loaded a `/dev/videoX` node appears.
+(`lsusb`). The built-in `vcam_replay` driver binds automatically and creates
+`/dev/videoX`; add `vcam_replay.devices=0` to the kernel command line to skip
+the extra local-feed camera. An external `.ko` can also be used with a matching
+kernel that does not already contain the driver.
 
 ## Device model internals / protocol
 
@@ -114,3 +139,10 @@ Inside the guest, the device enumerates as `1209:000a QEMU Replay Camera`
 
 The wire-protocol constants are duplicated from `../driver/vcam_uapi.h` —
 keep the two in sync if you change the protocol.
+
+The frames file must be nonempty and an exact multiple of the configured
+frame size. GREY uses width*height bytes, YUYV uses width*height*2 bytes
+(and requires even width). There is no PGM header on this input. STREAMON
+rewinds to frame zero; the file loops indefinitely. Slow guests may skip
+source frames when an untouched pending frame is replaced. Live migration
+is disabled for this device.

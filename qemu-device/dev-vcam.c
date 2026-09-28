@@ -15,8 +15,7 @@
  *   - while streaming, one (32-byte header + payload) record per frame
  *     period on the bulk pipe, payload is a generated moving test pattern
  *
- * Next step for host-fed replay: replace vcam_generate_pattern() with a
- * reader that pulls Basler frames from the host (file/socket property).
+ * The optional frames= property replays a host file of packed raw frames.
  *
  * Wire protocol constants below must stay in sync with the guest driver's
  * driver/vcam_uapi.h.
@@ -74,6 +73,10 @@ struct USBVCamState {
     uint32_t height;
     uint32_t fps;
     char *format;
+    char *frames;
+    GMappedFile *frame_file;
+    size_t frame_count;
+    size_t frame_index;
 
     uint32_t fourcc;
     uint32_t payload_size;
@@ -243,7 +246,15 @@ static void vcam_frame_timer(void *opaque)
         stl_le_p(hdr + 20, 0);                  /* flags */
         stl_le_p(hdr + 24, 0);
         stl_le_p(hdr + 28, 0);
-        vcam_generate_pattern(s, s->xfer_buf + VCAM_FRAME_HDR_SIZE);
+        if (s->frame_file) {
+            const char *frames = g_mapped_file_get_contents(s->frame_file);
+
+            memcpy(s->xfer_buf + VCAM_FRAME_HDR_SIZE,
+                   frames + s->frame_index * s->payload_size, s->payload_size);
+            s->frame_index = (s->frame_index + 1) % s->frame_count;
+        } else {
+            vcam_generate_pattern(s, s->xfer_buf + VCAM_FRAME_HDR_SIZE);
+        }
 
         s->xfer_len = VCAM_FRAME_HDR_SIZE + s->payload_size;
         s->xfer_pos = 0;
@@ -272,6 +283,7 @@ static void vcam_stream_start(USBVCamState *s)
         return;
     }
     s->streaming = true;
+    s->frame_index = 0;
     s->frame_pending = false;
     s->xfer_pos = 0;
     s->next_frame_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -376,6 +388,7 @@ static void vcam_handle_data(USBDevice *dev, USBPacket *p)
 static void vcam_realize(USBDevice *dev, Error **errp)
 {
     USBVCamState *s = USB_VCAM(dev);
+    g_autoptr(GError) error = NULL;
 
     if (!s->format || g_ascii_strcasecmp(s->format, "grey") == 0) {
         s->fourcc = VCAM_FMT_GREY;
@@ -399,6 +412,26 @@ static void vcam_realize(USBDevice *dev, Error **errp)
     }
     vcam_set_interval(s);
 
+    if (s->frames) {
+        size_t size;
+
+        s->frame_file = g_mapped_file_new(s->frames, false, &error);
+        if (!s->frame_file) {
+            error_setg(errp, "cannot open frames '%s': %s",
+                       s->frames, error->message);
+            return;
+        }
+        size = g_mapped_file_get_length(s->frame_file);
+        if (!size || size % s->payload_size) {
+            error_setg(errp, "frames file must contain a nonzero multiple of %u bytes",
+                       s->payload_size);
+            g_mapped_file_unref(s->frame_file);
+            s->frame_file = NULL;
+            return;
+        }
+        s->frame_count = size / s->payload_size;
+    }
+
     usb_desc_create_serial(dev);
     usb_desc_init(dev);
     s->bulk_in = usb_ep_get(dev, USB_TOKEN_IN, 1);
@@ -415,6 +448,9 @@ static void vcam_unrealize(USBDevice *dev)
         timer_free(s->frame_timer);
     }
     g_free(s->xfer_buf);
+    if (s->frame_file) {
+        g_mapped_file_unref(s->frame_file);
+    }
 }
 
 static const VMStateDescription vmstate_usb_vcam = {
@@ -427,6 +463,7 @@ static const Property vcam_properties[] = {
     DEFINE_PROP_UINT32("height", USBVCamState, height, 480),
     DEFINE_PROP_UINT32("fps",    USBVCamState, fps, 30),
     DEFINE_PROP_STRING("format", USBVCamState, format),
+    DEFINE_PROP_STRING("frames", USBVCamState, frames),
 };
 
 static void vcam_class_init(ObjectClass *klass, const void *data)

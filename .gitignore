@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+driver/*.o
+driver/*.ko
+driver/*.mod
+driver/*.mod.c
+driver/.*.cmd
+driver/Module.symvers
+driver/modules.order
+tools/vcam_feed
+artifacts/

@@ -24,6 +24,8 @@
 #include <linux/vmalloc.h>
 #include <linux/kthread.h>
 #include <linux/sched.h>
+#include <linux/uaccess.h>
+#include <media/v4l2-fh.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-common.h>
 #include <media/videobuf2-vmalloc.h>
@@ -240,7 +242,7 @@ static int vcam_alloc_frame_bufs(struct vcam_dev *vcam)
 	return 0;
 }
 
-static int vcam_check_format(u32 width, u32 height, u32 fourcc)
+int vcam_check_format(u32 width, u32 height, u32 fourcc)
 {
 	if (!vcam_fourcc_valid(fourcc))
 		return -EINVAL;
@@ -255,6 +257,7 @@ static int vcam_check_format(u32 width, u32 height, u32 fourcc)
 int vcam_set_format(struct vcam_dev *vcam, u32 width, u32 height, u32 fourcc)
 {
 	int ret;
+	u32 old_width, old_height, old_fourcc;
 
 	ret = vcam_check_format(width, height, fourcc);
 	if (ret)
@@ -273,11 +276,23 @@ int vcam_set_format(struct vcam_dev *vcam, u32 width, u32 height, u32 fourcc)
 	    fourcc == vcam->fourcc)
 		goto out;
 
+	old_width = vcam->width;
+	old_height = vcam->height;
+	old_fourcc = vcam->fourcc;
+	/* A delivery may still be leaving its critical section after STREAMOFF. */
+	mutex_lock(&vcam->deliver_lock);
 	vcam->width = width;
 	vcam->height = height;
 	vcam->fourcc = fourcc;
 	vcam->sizeimage = vcam_sizeimage(width, height, fourcc);
 	ret = vcam_alloc_frame_bufs(vcam);
+	if (ret) {
+		vcam->width = old_width;
+		vcam->height = old_height;
+		vcam->fourcc = old_fourcc;
+		vcam->sizeimage = vcam_sizeimage(old_width, old_height, old_fourcc);
+	}
+	mutex_unlock(&vcam->deliver_lock);
 out:
 	mutex_unlock(&vcam->lock);
 	return ret;
@@ -315,7 +330,7 @@ static int vcam_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 	struct vcam_dev *vcam = vb2_get_drv_priv(q);
 
 	if (*num_planes)
-		return sizes[0] < vcam->sizeimage ? -EINVAL : 0;
+		return *num_planes != 1 || sizes[0] < vcam->sizeimage ? -EINVAL : 0;
 
 	*num_planes = 1;
 	sizes[0] = vcam->sizeimage;
@@ -360,6 +375,7 @@ static int vcam_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct vcam_dev *vcam = vb2_get_drv_priv(q);
 	ktime_t period;
+	int ret;
 
 	if (vcam->dying) {
 		vcam_return_all_buffers(vcam, VB2_BUF_STATE_QUEUED);
@@ -373,8 +389,19 @@ static int vcam_start_streaming(struct vb2_queue *q, unsigned int count)
 	period = vcam->period;
 	spin_unlock_irq(&vcam->slock);
 
-	if (vcam->on_stream)
-		vcam->on_stream(vcam->stream_priv, true);
+	if (vcam->on_stream) {
+		ret = vcam->on_stream(vcam->stream_priv, true);
+		if (ret) {
+			spin_lock_irq(&vcam->slock);
+			vcam->streaming = false;
+			vcam->deliver_pending = false;
+			spin_unlock_irq(&vcam->slock);
+			mutex_lock(&vcam->deliver_lock);
+			mutex_unlock(&vcam->deliver_lock);
+			vcam_return_all_buffers(vcam, VB2_BUF_STATE_QUEUED);
+			return ret;
+		}
+	}
 
 	if (vcam->self_paced)
 		hrtimer_start(&vcam->timer, period, HRTIMER_MODE_REL);
@@ -409,8 +436,10 @@ static const struct vb2_ops vcam_vb2_ops = {
 	.buf_queue		= vcam_buf_queue,
 	.start_streaming	= vcam_start_streaming,
 	.stop_streaming		= vcam_stop_streaming,
+#ifdef VCAM_HAVE_VB2_WAIT_OPS
 	.wait_prepare		= vb2_ops_wait_prepare,
 	.wait_finish		= vb2_ops_wait_finish,
+#endif
 };
 
 /* ------------------------------------------------------------------ */
@@ -620,8 +649,13 @@ struct vcam_dev *vcam_create(struct device *parent,
 	if (ret)
 		goto err_free;
 
+#ifdef VCAM_HAVE_HRTIMER_SETUP
+	hrtimer_setup(&vcam->timer, vcam_timer_fn, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL);
+#else
 	hrtimer_init(&vcam->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	vcam->timer.function = vcam_timer_fn;
+#endif
 
 	vcam->thread = kthread_run(vcam_thread_fn, vcam, "%s-deliver",
 				   vcam->name);
@@ -630,6 +664,8 @@ struct vcam_dev *vcam_create(struct device *parent,
 		goto err_bufs;
 	}
 
+	/* Required by v4l2_device_register() when the chardev has no parent. */
+	strscpy(vcam->v4l2_dev.name, vcam->name, sizeof(vcam->v4l2_dev.name));
 	ret = v4l2_device_register(parent, &vcam->v4l2_dev);
 	if (ret)
 		goto err_thread;
@@ -689,6 +725,7 @@ err_free:
 void vcam_detach_producer(struct vcam_dev *vcam)
 {
 	mutex_lock(&vcam->lock);
+	vcam->dying = true;
 	vcam->on_stream = NULL;
 	vcam->stream_priv = NULL;
 	mutex_unlock(&vcam->lock);
@@ -696,6 +733,8 @@ void vcam_detach_producer(struct vcam_dev *vcam)
 
 void vcam_destroy(struct vcam_dev *vcam)
 {
+	/* unregister may synchronously invoke vcam_video_release(). */
+	get_device(&vcam->vdev.dev);
 	mutex_lock(&vcam->lock);
 	vcam->dying = true;
 	mutex_unlock(&vcam->lock);
@@ -706,6 +745,7 @@ void vcam_destroy(struct vcam_dev *vcam)
 	hrtimer_cancel(&vcam->timer);
 	kthread_stop(vcam->thread);
 	v4l2_device_unregister(&vcam->v4l2_dev);
+	put_device(&vcam->vdev.dev);
 	/*
 	 * Frame buffers and the vcam struct itself are freed by
 	 * vcam_video_release() once the last open fd is closed

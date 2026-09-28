@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0
+config VIDEO_VCAM_REPLAY
+	tristate "QEMU USB replay camera"
+	depends on VIDEO_DEV && USB
+	select VIDEOBUF2_V4L2
+	select VIDEOBUF2_VMALLOC
+	help
+	  Receive GREY/YUYV frames from the QEMU usb-vcam device and expose
+	  them as a V4L2 capture device. Also provides /dev/vcamN for local
+	  userspace injection. Select Y to link the driver into the kernel.
+	  Use vcam_replay.devices=0 on the kernel command line for USB only.

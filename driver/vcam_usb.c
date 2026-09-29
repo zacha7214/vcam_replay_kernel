@@ -29,7 +29,6 @@
 enum vcam_rx_state {
 	VCAM_RX_HDR,
 	VCAM_RX_PAYLOAD,
-	VCAM_RX_SKIP,
 };
 
 struct vcam_usb {
@@ -49,7 +48,6 @@ struct vcam_usb {
 	u8 *frame_buf;
 	u32 frame_size;
 	u32 frame_have;
-	u32 skip_left;
 };
 
 static void vcam_usb_parse(struct vcam_usb *vu, const u8 *data, u32 len)
@@ -83,9 +81,9 @@ static void vcam_usb_parse(struct vcam_usb *vu, const u8 *data, u32 len)
 				dev_warn_ratelimited(&vu->intf->dev,
 					"frame %u does not match negotiated format, skipping\n",
 					le32_to_cpu(vu->hdr.seq));
-				vu->state = VCAM_RX_SKIP;
-				vu->skip_left =
-					le32_to_cpu(vu->hdr.payload_len);
+				memmove(&vu->hdr, (u8 *)&vu->hdr + 1,
+					sizeof(vu->hdr) - 1);
+				vu->hdr_have = sizeof(vu->hdr) - 1;
 			} else {
 				vu->state = VCAM_RX_PAYLOAD;
 				vu->frame_have = 0;
@@ -106,14 +104,6 @@ static void vcam_usb_parse(struct vcam_usb *vu, const u8 *data, u32 len)
 			}
 			break;
 
-		case VCAM_RX_SKIP:
-			take = min_t(u32, vu->skip_left, len);
-			vu->skip_left -= take;
-			data += take;
-			len -= take;
-			if (!vu->skip_left)
-				vu->state = VCAM_RX_HDR;
-			break;
 		}
 	}
 }
@@ -134,14 +124,20 @@ static void vcam_usb_read_complete(struct urb *urb)
 	default:
 		dev_warn_ratelimited(&vu->intf->dev, "bulk read status %d\n",
 				     urb->status);
+		/* A failed transfer may have lost bytes; seek a fresh header. */
+		vu->state = VCAM_RX_HDR;
+		vu->hdr_have = 0;
 		break;
 	}
 
 	if (READ_ONCE(vu->running)) {
 		ret = usb_submit_urb(urb, GFP_ATOMIC);
-		if (ret && ret != -EPERM)
+		if (ret && ret != -EPERM) {
 			dev_err(&vu->intf->dev, "urb resubmit failed: %d\n",
 				ret);
+			WRITE_ONCE(vu->running, false);
+			vb2_queue_error(&vu->vcam->queue);
+		}
 	}
 }
 
@@ -155,7 +151,7 @@ static int vcam_usb_set_stream(struct vcam_usb *vu, bool enable)
 }
 
 /* Called from vcam core with vcam->lock held, process context. */
-static void vcam_usb_on_stream(void *priv, bool enable)
+static int vcam_usb_on_stream(void *priv, bool enable)
 {
 	struct vcam_usb *vu = priv;
 	int ret;
@@ -164,6 +160,9 @@ static void vcam_usb_on_stream(void *priv, bool enable)
 		vu->state = VCAM_RX_HDR;
 		vu->hdr_have = 0;
 		vu->frame_have = 0;
+		ret = vcam_usb_set_stream(vu, true);
+		if (ret)
+			return ret;
 		WRITE_ONCE(vu->running, true);
 
 		usb_fill_bulk_urb(vu->urb, vu->udev, vu->bulk_in_pipe,
@@ -174,17 +173,15 @@ static void vcam_usb_on_stream(void *priv, bool enable)
 			dev_err(&vu->intf->dev, "urb submit failed: %d\n",
 				ret);
 			WRITE_ONCE(vu->running, false);
-			return;
+			vcam_usb_set_stream(vu, false);
+			return ret;
 		}
-		ret = vcam_usb_set_stream(vu, true);
-		if (ret)
-			dev_err(&vu->intf->dev, "stream start failed: %d\n",
-				ret);
 	} else {
 		vcam_usb_set_stream(vu, false);
 		WRITE_ONCE(vu->running, false);
 		usb_kill_urb(vu->urb);
 	}
+	return 0;
 }
 
 static int vcam_usb_probe(struct usb_interface *intf,
@@ -234,6 +231,13 @@ static int vcam_usb_probe(struct usb_interface *intf,
 	cfg.priv = vu;
 	cfg.name = "vcam-usb";
 	cfg.bus_info = busname;
+
+	/* Validate untrusted USB geometry before calculating sizes/allocating. */
+	ret = vcam_check_format(cfg.width, cfg.height, cfg.fourcc);
+	if (ret || !cfg.fps_num || !cfg.fps_den) {
+		ret = -EINVAL;
+		goto err_put;
+	}
 
 	vu->frame_size = vcam_sizeimage(cfg.width, cfg.height, cfg.fourcc);
 	vu->frame_buf = vmalloc(vu->frame_size);

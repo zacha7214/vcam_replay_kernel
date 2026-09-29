@@ -100,7 +100,6 @@ static const struct file_operations vcam_cdev_fops = {
 	.owner		= THIS_MODULE,
 	.write		= vcam_cdev_write,
 	.unlocked_ioctl	= vcam_cdev_ioctl,
-	.llseek		= no_llseek,
 };
 
 struct vcam_chardev *vcam_chardev_create(const struct vcam_config *cfg)

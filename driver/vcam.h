@@ -39,7 +39,7 @@ struct vcam_config {
 	 * process context when V4L2 streaming starts/stops. May sleep.
 	 * The USB frontend uses this to start/stop the device-side stream.
 	 */
-	void (*on_stream)(void *priv, bool enable);
+	int (*on_stream)(void *priv, bool enable);
 	void *priv;
 	const char *name;	/* short instance name, e.g. "vcam0" */
 	const char *bus_info;	/* for VIDIOC_QUERYCAP */
@@ -69,7 +69,7 @@ struct vcam_dev {
 	bool streaming;		/* under slock */
 	bool dying;		/* under lock; blocks new STREAMON/submits */
 
-	void (*on_stream)(void *priv, bool enable);
+	int (*on_stream)(void *priv, bool enable);
 	void *stream_priv;
 
 	/* pacing */
@@ -117,6 +117,7 @@ static inline u32 vcam_sizeimage(u32 width, u32 height, u32 fourcc)
 }
 
 int vcam_fourcc_valid(u32 fourcc);
+int vcam_check_format(u32 width, u32 height, u32 fourcc);
 
 /* chardev frontend (vcam_chardev.c) */
 struct vcam_chardev;
